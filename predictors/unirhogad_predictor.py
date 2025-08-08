@@ -127,19 +127,19 @@ class Uni_RHO_GAD_Predictor(nn.Module):
             # 先将要池化的特征存入图中
             g_batch.ndata['h_for_readout'] = h_robust_nodes
 
-            if task == 'n':
-                if not self.is_single_graph:
-                    # 对于多图节点任务，直接使用所有节点的表示
-                    task_level_rep = h_robust_nodes
-                else:
-                    # 单图节点任务：对每个子图进行池化
-                    task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
-            elif task == 'g':
-                # 图任务：对每个图进行池化
-                task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
-            elif task == 'e':
-                # 边任务: 对端点子图池化
-                task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
+            # if task == 'n':
+            #     # 无论是单图还是多图，节点任务在融合前都应被池化为图级别表示
+            #     # 因为 g_batch 对于多图节点任务也是一个批处理图
+            #     task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
+            # elif task == 'g':
+            #     # 图任务：对每个图进行池化
+            #     task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
+            # elif task == 'e':
+            #     # 边任务: 对端点子图池化
+            #     task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
+
+            # 统一的池化逻辑
+            task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
 
             # 清理临时特征
             g_batch.ndata.pop('h_for_readout')
@@ -154,11 +154,19 @@ class Uni_RHO_GAD_Predictor(nn.Module):
 
                 # 计算 one-class 损失
                 if normal_masks and task in normal_masks and normal_masks[task].sum() > 0:
-                    # one-class 损失作用于Readout后的任务级别表示
-                    normal_reps = task_level_rep[normal_masks[task]]
-                    center = self.centers[task]
-                    one_class_loss = torch.pow(normal_reps - center, 2).mean()
-                    total_one_class_loss += one_class_loss
+                    # 无论是哪个任务，task_level_rep 都是图级别的。
+                    # 因此，我们需要一个图级别的掩码来索引它。
+                    # 对于节点任务('n')，我们使用图任务('g')的掩码，因为它们共享相同的图批次。
+                    mask_key = 'g' if task == 'n' and not self.is_single_graph else task
+                    
+                    if mask_key in normal_masks and normal_masks[mask_key].sum() > 0:
+                        current_mask = normal_masks[mask_key]
+                        # 确保掩码和张量的长度匹配
+                        if current_mask.shape[0] == task_level_rep.shape[0]:
+                            normal_reps = task_level_rep[current_mask]
+                            center = self.centers[task]
+                            one_class_loss = torch.pow(normal_reps - center, 2).mean()
+                            total_one_class_loss += one_class_loss
         
 
         # --- Step 4: 通过并行的融合头进行预测 ---

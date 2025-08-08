@@ -627,15 +627,14 @@ def collate_fn_unify(samples,
         batched_graph = dgl.batch(graphs)
         
         # 准备模型输入
-        # 预计算的嵌入将在训练器中完成，这里只准备图和标签
-        g_info = {'n': batched_graph, 'e': batched_graph, 'g': batched_graph}
+        # 预计算的嵌入将在训练器中完成，这里只准备图和节点标签
+        g_info = {'n': batched_graph, 'g': batched_graph}
         
         # 准备标签
         batched_labels = {}
         if labels_list[0]['n'].numel() > 0:
             batched_labels['n'] = torch.cat([d['n'] for d in labels_list])
-        if labels_list[0]['e'].numel() > 0:
-            batched_labels['e'] = torch.cat([d['e'] for d in labels_list])
+
         if labels_list[0]['g'].numel() > 0:
             batched_labels['g'] = torch.stack([d['g'] for d in labels_list])
             
@@ -673,7 +672,8 @@ def collate_fn_unify(samples,
                     subgraph = sampler.sample(original_graph, tid)
                     # 手动将原始特征复制到子图中
                     # 子图的节点ID是原始图ID的子集
-                    subgraph.ndata['feature'] = original_features[subgraph.nodes()]
+                    original_node_ids = subgraph.ndata[dgl.NID]
+                    subgraph.ndata['feature'] = original_features[original_node_ids]
                     subgraph_list_n.append(subgraph)
             else:   # 如果没有采样器，使用简单的k-hop作为回退
                 for tid in target_ids_n:

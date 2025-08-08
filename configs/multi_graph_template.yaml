@@ -1,0 +1,71 @@
+# ======================================================================
+#   Base Configuration for Multi-Graph Datasets
+# ======================================================================
+
+# e.g. bm/dgl/bm_mn_dgl, bm/dgl/bm_ms_dgl, bm/dgl/bm_mn_mt_dgl, mnist_processed/mnist0_strict, mnist_processed/mnist1_strict
+dataset: 'mutag/dgl/mutag0'
+
+# --- 路径与设备 ---
+data_dir: ./data
+results_dir: ./results
+save_dir: ./pretrained
+device: cuda
+
+# --- 训练控制 ---
+seed: 42
+num_trials: 5
+epochs: 100
+patience: 30
+batch_size: 32
+metric: AUPRC
+
+# --- 模型与优化器 ---
+lr: 5e-4
+l2: 1e-5
+hid_dim: 128
+dropout: 0.3
+activation: 'ReLU'
+residual: True
+norm: 'layernorm'
+base_gnn_layers: 2
+final_mlp_layers: 2
+gna_proj_dim: 128
+
+# --- 预训练模型架构 ---
+pretrain_path: './pretrained/mutag_dgl_mutag0_enc_gcn2_dec_gcn1_e100_h128_loss_sce.pt'
+pretrain_encoder_type: 'gcn'
+pretrain_decoder_type: 'gcn'
+pretrain_hid_dim: 128
+pretrain_encoder_num_layer: 2
+pretrain_decoder_num_layer: 1
+
+# --- 预训练 PAA 参数 ---
+pretrain_epochs: 100
+pretrain_lr: 5e-3
+pretrain_batch_size: 512
+scheduler_step: 50
+scheduler_gamma: 0.5
+mask_ratio: 0.5
+replace_ratio: 0.1
+drop_edge_rate: 0.2
+loss_fn: 'sce'
+alpha_l: 2.0
+w_contrastive: 0.3
+w_recon: 1.0
+
+# --- Uni-RHO-GAD 特定参数 ---
+all_tasks: 'ng' # 多图任务
+cross_modes: "ng2ng,n2ng,g2ng"
+w_one_class: 2.0
+w_gna: 5.0
+w_classification: 1.0
+
+# --- 数据增强控制 ---
+# 多图场景默认不使用我们设计的异常生成
+use_anomaly_generation: False
+use_node_aug: False
+use_edge_aug: False
+use_downstream_multi_graph_aug: False
+aug_ratio: 0.5
+aug_num_perturb_edges: 5
+aug_feature_mix_ratio: 0.5

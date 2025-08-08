@@ -1,8 +1,10 @@
 import torch
+import yaml
 import torch.nn as nn
 from tqdm import tqdm
 import os
 import argparse
+from argparse import Namespace
 import pandas as pd
 import time
 from functools import partial
@@ -16,66 +18,41 @@ from torch.utils.data import WeightedRandomSampler
 def get_args():
     """解析所有命令行参数"""
     parser = argparse.ArgumentParser("Uni-RHO-GAD End-to-End Training")
-    
-    # --- 数据与路径参数 ---
-    parser.add_argument('--dataset', type=str, required=True, help="Name of the dataset (e.g., 'reddit', 'mutag/dgl/mutag0')")
-    parser.add_argument('--data_dir', type=str, default='./data', help='Root directory where data is stored')
-    parser.add_argument('--pretrain_path', type=str, required=True, help='Path to the saved pretrained model weights (.pt file)')
-    parser.add_argument('--results_dir', type=str, default='./results', help='Directory to save the final results CSV')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-
-    # =================================================================
-    #   核心修改点：添加数据增强相关的命令行参数
-    # =================================================================
-    parser.add_argument('--use_anomaly_generation', action='store_true', 
-                        help="Enable generation of artificial anomalies for single-graph tasks.")
-    parser.add_argument('--use_node_aug', action='store_true', 
-                        help="Enable artificial anomaly generation for node tasks (if use_anomaly_generation is set).")
-    parser.add_argument('--use_edge_aug', action='store_true', 
-                        help="Enable artificial anomaly generation for edge tasks (if use_anomaly_generation is set).")
-    parser.add_argument('--aug_ratio', type=float, default=0.5, help="Ratio of normal samples to be perturbed into anomalies per batch.")
-    parser.add_argument('--aug_num_perturb_edges', type=int, default=5, help="Number of perturbed edges to add for each artificial anomaly.")
-    parser.add_argument('--aug_feature_mix_ratio', type=float, default=0.5, help="Mixing ratio for feature perturbation (beta).")
-    
-    # --- 训练控制参数 ---
-    parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument('--num_trials', type=int, default=5, help="Number of trials with different seeds for robust evaluation")
-    parser.add_argument('--epochs', type=int, default=200, help="Maximum number of training epochs")
-    parser.add_argument('--batch_size', type=int, default=16, help="Batch size for training")
-    parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
-    parser.add_argument('--metric', type=str, default='AUROC', choices=['AUROC', 'AUPRC', 'MacroF1'], help='Metric for early stopping')
-    
-
-    # --- 模型与优化器参数 ---
-    parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--l2', type=float, default=1e-5)
-    parser.add_argument('--hid_dim', type=int, default=64, help='Embedding dimension')
-    parser.add_argument('--dropout', type=float, default=0.3)
-
-    parser.add_argument('--pretrain_encoder_type', type=str, default='gcn', help="The GNN type of the loaded pretrained encoder.")
-    parser.add_argument('--pretrain_decoder_type', type=str, default='gcn', help="The type of the loaded pretrained decoder.")
-    parser.add_argument('--pretrain_hid_dim', type=int, default=64, help="The hidden dim of the loaded pretrained model.")
-    parser.add_argument('--pretrain_encoder_num_layer', type=int, default=2, help="The number of layers of the loaded pretrained encoder.")
-    parser.add_argument('--pretrain_decoder_num_layer', type=int, default=1, help="The number of layers of the loaded pretrained decoder.")
-    
-    parser.add_argument('--base_gnn_layers', type=int, default=2)
-    parser.add_argument('--final_mlp_layers', type=int, default=2)
-    parser.add_argument('--gna_proj_dim', type=int, default=128)
-    parser.add_argument('--activation', type=str, default='ReLU')
-    parser.add_argument('--residual', action='store_true', default=True)
-    parser.add_argument('--norm', type=str, default='layernorm')
-
-    # --- Uni-RHO-GAD 特定参数 ---
-    parser.add_argument('--all_tasks', type=str, default='neg', help="All possible tasks in the dataset (e.g., 'n', 'ng', 'neg')")
-    parser.add_argument('--cross_modes', type=str, default='ng2ng,n2ng,g2ng', help="Comma-separated list of cross modes to evaluate (e.g., 'ng2ng,n2ng')")
-    parser.add_argument('--w_one_class', type=float, default=1.0, help="Weight for one-class loss")
-    parser.add_argument('--w_gna', type=float, default=1.0, help="Weight for GNA contrastive loss")
-    parser.add_argument('--w_classification', type=float, default=1.0, help="Weight for supervised classification loss")
-    
+    parser.add_argument('--config', type=str, required=True, help="Path to the YAML configuration file for the experiment.")
+    # (可选) 允许命令行覆盖个别关键参数
+    parser.add_argument('--device', type=str, default=None, help="Override the device setting in the config file.")
+    parser.add_argument('--epochs', type=int, default=None, help="Override the epochs setting in the config file.")
     return parser.parse_args()
 
 
 def main(args):
+
+    # 1. 解析命令行参数，主要是获取配置文件路径
+    cmd_args = get_args()
+
+    # 2. 加载配置文件
+    with open(cmd_args.config, 'r') as f:
+        config_dict = yaml.safe_load(f)
+    
+    # 3. 将字典转换为命名空间对象，方便以 `args.key` 的形式访问
+    args = Namespace(**config_dict)
+    
+    # 4. (可选) 让命令行的个别参数覆盖配置文件中的值
+    if cmd_args.device is not None:
+        args.device = cmd_args.device
+    if cmd_args.epochs is not None:
+        args.epochs = cmd_args.epochs
+
+    try:
+        # 对所有可能使用科学记数法的浮点数参数进行转换
+        args.lr = float(args.lr)
+        args.pretrain_lr = float(args.pretrain_lr)
+        args.l2 = float(args.l2)
+    except (ValueError, TypeError) as e:
+        print(f"Error: Failed to convert one or more config parameters to their expected numeric types.")
+        print(f"Please check your YAML file for correct formatting. Original error: {e}")
+        return # 转换失败则直接退出
+
     """主执行函数"""
     set_seed(args.seed)
     
@@ -90,11 +67,6 @@ def main(args):
     val_subset = dataset.get_subset('val', trial_id=0)
     test_subset = dataset.get_subset('test', trial_id=0)
     
-    # collate_fn = partial(collate_fn_unify, sampler=dataset.sampler)
-
-    # =================================================================
-    #   核心修改点：使用 partial 绑定所有需要的参数
-    # =================================================================
     anomaly_generator_instance = None
     if args.use_anomaly_generation and dataset.is_single_graph:
         # 从 dataset 中获取已经初始化好的 generator
@@ -111,11 +83,6 @@ def main(args):
         use_edge_aug=args.use_edge_aug
     )
 
-    # train_loader = torch.utils.data.DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    # val_loader = torch.utils.data.DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-    # test_loader = torch.utils.data.DataLoader(test_subset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-
-    # ================================================================
     train_loader = torch.utils.data.DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_with_aug)
     val_loader = torch.utils.data.DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_with_aug)
     test_loader = torch.utils.data.DataLoader(test_subset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_with_aug)
@@ -185,18 +152,42 @@ def main(args):
     # 4. ==================== 结果保存 ====================
     if final_test_metrics:
         all_results = []
+
+        params_to_save = [
+            # 实验标识
+            'dataset', 'seed', 'pretrain_model', 'cross_mode',
+            # 模型架构
+            'hid_dim', 'base_gnn_layers', 'final_mlp_layers',
+            # 优化器与训练
+            'lr', 'l2', 'batch_size', 'epochs', 'patience',
+            # 损失权重
+            'w_one_class', 'w_gna', 'w_classification',
+            # 数据增强控制
+            'use_anomaly_generation', 'use_node_aug', 'use_edge_aug',
+            'use_downstream_multi_graph_aug', 'aug_ratio',
+            'aug_num_perturb_edges', 'aug_feature_mix_ratio',
+            # 性能
+            'time_cost'
+        ]
+
         for mode, metrics_dict in final_test_metrics.items():
-            result_row = {
-                'dataset': args.dataset,
-                'pretrain_model': os.path.basename(args.pretrain_path),
-                'cross_mode': mode,
-                'hid_dim': args.hid_dim,
-                'lr': args.lr,
-                'time_cost': total_time_cost / len(final_test_metrics)
-            }
+            # --- 步骤1: 初始化基础信息和所有要保存的参数 ---
+            result_row = {}
+            for param in params_to_save:
+                # 使用 getattr 从 args 对象中获取值，如果不存在则返回 None
+                result_row[param] = getattr(args, param, None)
+            
+            # --- 步骤2: 更新特定于当前循环的信息 ---
+            result_row['pretrain_model'] = os.path.basename(args.pretrain_path)
+            result_row['cross_mode'] = mode
+            # 计算每个 mode 的平均时间成本
+            result_row['time_cost'] = total_time_cost / len(final_test_metrics) if final_test_metrics else total_time_cost
+
+            # --- 步骤3: 添加所有性能指标 ---
             for task, metrics in metrics_dict.items():
                 for metric_name, value in metrics.items():
                     result_row[f'{task}_{metric_name}'] = value
+            
             all_results.append(result_row)
         
         results_df = pd.DataFrame(all_results)
@@ -209,11 +200,12 @@ def main(args):
         
         results_df.to_csv(save_path, index=False)
         print("\n--- Final Test Results ---")
-        print(results_df)
+        # 使用 to_string() 打印完整的 DataFrame，避免列被省略
+        print(results_df.to_string())
         print(f"\nResults saved to: {save_path}")
     else:
         print("Training finished, but no valid test metrics were generated.")
-
+        
 if __name__ == '__main__':
     args = get_args()
     main(args)

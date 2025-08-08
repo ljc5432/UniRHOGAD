@@ -2,7 +2,7 @@
 from typing import Optional
 from itertools import chain
 from functools import partial
-
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,7 +11,6 @@ import numpy as np
 import dgl
 from dgl import DGLGraph
 
-# 从我们的新位置导入
 from gnn_zoo.homogeneous_gnns import GCN, GIN, BWGNN
 from utils.misc import obtain_act, obtain_norm, sce_loss
 from data.anomaly_generator import AnomalyGenerator
@@ -48,6 +47,67 @@ def drop_edge(graph, drop_rate, return_edges=False):
         return ng, (dsrc, ddst)
     return ng
 
+
+def drop_nodes(g: dgl.DGLGraph, drop_rate: float = 0.2):
+    """随机丢弃图中一定比例的节点"""
+    if drop_rate <= 0:
+        return g
+    
+    num_nodes = g.num_nodes()
+    num_to_keep = int(num_nodes * (1 - drop_rate))
+    nodes_to_keep = torch.randperm(num_nodes, device=g.device)[:num_to_keep]
+    
+    return dgl.node_subgraph(g, nodes_to_keep, store_ids=True)
+
+def perturb_edges(g: dgl.DGLGraph, perturb_rate: float = 0.2):
+    """随机扰动图中一定比例的边（删除或添加）"""
+    if perturb_rate <= 0:
+        return g
+        
+    num_edges_to_perturb = int(g.num_edges() * perturb_rate)
+    if num_edges_to_perturb == 0:
+        return g
+
+    src, dst = g.edges()
+    
+    # 随机删除边
+    edges_to_drop = torch.randperm(g.num_edges(), device=g.device)[:num_edges_to_perturb]
+    edge_mask = torch.ones(g.num_edges(), dtype=torch.bool, device=g.device)
+    edge_mask[edges_to_drop] = False
+    src_kept, dst_kept = src[edge_mask], dst[edge_mask]
+    
+    # 随机添加边
+    new_src = torch.randint(0, g.num_nodes(), (num_edges_to_perturb,), device=g.device)
+    new_dst = torch.randint(0, g.num_nodes(), (num_edges_to_perturb,), device=g.device)
+    
+    final_src = torch.cat([src_kept, new_src])
+    final_dst = torch.cat([dst_kept, new_dst])
+    
+    return dgl.graph((final_src, final_dst), num_nodes=g.num_nodes())
+
+def augment_graph_view(g: dgl.DGLGraph, features: torch.Tensor, drop_node_rate: float, perturb_edge_rate: float, mask_feature_rate: float):
+    """为图级别对比学习创建单个增强视图"""
+    
+    # 1. 边扰动
+    g_aug = perturb_edges(g, perturb_edge_rate)
+    
+    # 2. 节点丢弃
+    g_aug = drop_nodes(g_aug, drop_node_rate)
+    
+    # 3. 属性掩码
+    # 获取子图对应的原始特征
+    original_node_ids = g_aug.ndata[dgl.NID]
+    features_aug = features[original_node_ids].clone()
+    
+    num_nodes, feat_dim = features_aug.shape
+    mask = torch.rand((num_nodes, feat_dim), device=features.device) < mask_feature_rate
+    features_aug[mask] = 0.0 # 简单地置为0
+    
+    g_aug.ndata['feature'] = features_aug
+    
+    return g_aug
+
+
 # ======================================================================
 #   Predictive SSL
 # ======================================================================
@@ -71,7 +131,8 @@ class GraphMAE_PAA(nn.Module):
             alpha_l: float = 2.0,
             concat_hidden: bool = False,
             anomaly_generator: Optional[AnomalyGenerator] = None,
-            w_recon: float = 0.5, w_contrastive: float = 1.0
+            w_recon: float = 0.5, w_contrastive: float = 1.0,
+            **kwargs
          ):
         super(GraphMAE_PAA, self).__init__()
         self._mask_ratio = mask_ratio
@@ -222,88 +283,125 @@ class GraphMAE_PAA(nn.Module):
         loss = (z_normal * z_augmented_anomaly).sum(dim=1).mean()
         return loss
 
-    # def forward(self, g, x):
-    #     # 1. 创建带噪声的图和特征
-    #     # 边丢弃作为一种数据增强
-    #     use_g = drop_edge(g, self._drop_edge_rate)
-    #     # 应用混合掩码策略
-    #     enc_x, mask_nodes = self.encoding_mask_noise(g, x)
-
-    #     # 2. 编码
-    #     enc_rep = self.encoder(use_g, enc_x)
-
-    #     # 3. 解码
-    #     # 投影到解码器的维度空间
-    #     rep = self.encoder_to_decoder(enc_rep)
+    def forward(self, g: dgl.DGLGraph, x: torch.Tensor) -> torch.Tensor:
+        """
+        场景自适应的前向传播。
+        """
+        # 默认执行重建损失
+        loss_recon = self._forward_recon_only(g, x)
         
-    #     # 如果解码器是GNN类型，需要再次掩码以防止信息泄露
-    #     if isinstance(self.decoder, (GCN, GIN, BWGNN)):
-    #         rep[mask_nodes] = 0
+        # 如果对比损失被启用，则计算并加权
+        if self.w_contrastive > 0:
+            loss_cont = 0.0
+            # --- 场景一：单图 PAA ---
+            if self.anomaly_generator is not None:
+                loss_cont = self._get_paa_contrastive_loss(g, x)
+            # --- 场景二：多图 GraphCL ---
+            elif g.batch_size > 1:
+                loss_cont = self._get_graphcl_contrastive_loss(g)
+            
+            return self.w_contrastive * loss_cont + self.w_recon * loss_recon
         
-    #     # 根据解码器类型进行重建
-    #     if isinstance(self.decoder, nn.Sequential): # MLP decoder
-    #         recon = self.decoder(rep)
-    #     else: # GNN decoder
-    #         recon = self.decoder(use_g, rep)
+        # 如果对比损失未启用，只返回重建损失
+        return loss_recon
 
-    #     # 4. 计算损失 (仅在掩码节点上)
-    #     loss = self.criterion(recon[mask_nodes], x[mask_nodes])
-    #     return loss
-
-    def forward(self, g, x):
-        # --- 1. 创建两个不同的“视图” ---
-        
-        # 视图一：标准的 GraphMAE_PAA 增强 (边丢弃 + 节点掩码)
+    def _forward_recon_only(self, g, x):
+        """标准的 GraphMAE 重建损失"""
         g1 = drop_edge(g, self._drop_edge_rate)
         x1, mask_nodes = self.encoding_mask_noise(g, x)
+        
+        if mask_nodes.numel() == 0: return torch.tensor(0.0, device=x.device)
 
-        # 视图二：我们的人工异常增强
-        # a. 选择一批节点进行增强
-        num_to_aug = int(g.num_nodes() * self._mask_ratio) # 复用 mask_ratio
+        rep1 = self.encoder(g1, x1)
+        rep1_decoded = self.encoder_to_decoder(rep1)
+        
+        if isinstance(self.decoder, (GCN, GIN, BWGNN)):
+            rep1_decoded[mask_nodes] = 0
+        
+        recon = self.decoder(g1, rep1_decoded) if not isinstance(self.decoder, nn.Sequential) else self.decoder(rep1_decoded)
+        
+        return self.criterion(recon[mask_nodes], x[mask_nodes])
+
+    def _get_paa_contrastive_loss(self, g, x):
+        """单图场景下的 PAA (节点级对比 + 重建)"""
+        # 1. 视图一：标准掩码
+        g1 = drop_edge(g, self._drop_edge_rate)
+        x1, mask_nodes = self.encoding_mask_noise(g, x)
+        
+        # 2. 视图二：人工异常
+        num_to_aug = int(g.num_nodes() * self._mask_ratio)
         nodes_to_aug = torch.randperm(g.num_nodes(), device=g.device)[:num_to_aug]
         
-        # b. 生成人工异常
+        if nodes_to_aug.numel() == 0: return self._forward_recon_only(g, x)
+        
         aug_node_ids, perturbed_feats, perturbed_graph = self.anomaly_generator.generate_for_nodes(nodes_to_aug)
         
-        # 如果未能生成异常，则只计算重建损失
-        if aug_node_ids is None:
-            rep1 = self.encoder(g1, x1)
-            recon = self.decoder(g1, self.encoder_to_decoder(rep1))
-            return self.criterion(recon[mask_nodes], x[mask_nodes])
+        if aug_node_ids is None or aug_node_ids.numel() == 0: return self._forward_recon_only(g, x)
 
-        # --- 2. 通过同一个编码器，计算两个视图的表示 ---
-        
-        # 视图一的表示
+        device = x.device
+        aug_node_ids = aug_node_ids.to(device)
+        perturbed_feats = perturbed_feats.to(device)
+        perturbed_graph = perturbed_graph.to(device)
+
+        # 3. 计算表示
         rep1 = self.encoder(g1, x1)
         
-        # 视图二的表示
         full_perturbed_features = x.clone()
-        perturbed_map = {nid.item(): feat for nid, feat in zip(aug_node_ids, perturbed_feats)}
-        for i, feat in perturbed_map.items():
-            full_perturbed_features[i] = feat
-        
-        device = x.device
-        # 将从 AnomalyGenerator 返回的 CPU 图，移动到 GPU
-        perturbed_graph = perturbed_graph.to(device)
+        full_perturbed_features[aug_node_ids] = perturbed_feats
         rep2_full = self.encoder(perturbed_graph, full_perturbed_features)
         
-        # --- 3. 计算损失 ---
-        
-        # a. 对比损失 (主要目标)
-        # 我们只对那些被增强的节点计算对比损失
+        # 4. 计算损失
         z1 = self.projection_head(rep1[aug_node_ids])
         z2 = self.projection_head(rep2_full[aug_node_ids])
-        loss_cont = self.info_nce_loss(z1, z2)
         
-        # b. 重建损失 (辅助目标)
-        # 仍然在视图一上进行
-        recon = self.decoder(g1, self.encoder_to_decoder(rep1))
-        loss_recon = self.criterion(recon[mask_nodes], x[mask_nodes])
+        return self.info_nce_loss(z1, z2)
+
+    def _get_graphcl_contrastive_loss(self, g_batched):
+        """多图场景下的 GraphCL-style (图级对比)"""
         
-        # --- 4. 组合总损失 ---
-        total_loss = self.w_contrastive * loss_cont + self.w_recon * loss_recon
+        # 1. 解批处理，为每张图创建两个视图
+        graphs = dgl.unbatch(g_batched)
+        g1_list, g2_list = [], []
+        # 获取原始特征，因为增强函数需要它
+        original_features = g_batched.ndata['feature']
         
-        return total_loss
+        # 我们需要知道每个小图的节点数，以便正确地切分特征
+        nodes_per_graph = g_batched.batch_num_nodes().tolist()
+        node_offsets = [0] + np.cumsum(nodes_per_graph).tolist()
+
+        for i, g in enumerate(graphs):
+            # 为每张图切分出它自己的原始特征
+            start, end = node_offsets[i], node_offsets[i+1]
+            g_features = original_features[start:end]
+            
+            g1_list.append(augment_graph_view(g, g_features, 0.2, 0.2, 0.2))
+            g2_list.append(augment_graph_view(g, g_features, 0.2, 0.2, 0.2))
+
+        # 2. 重新批处理
+        g1_batched = dgl.batch(g1_list)
+        g2_batched = dgl.batch(g2_list)
+        
+        # 3. 计算两个视图的图级别表示
+        rep1 = self.encoder(g1_batched, g1_batched.ndata['feature'])
+        
+        temp_feat_name = "_temp_rep1_for_pooling"
+        g1_batched.ndata[temp_feat_name] = rep1
+        pooled_rep1 = dgl.mean_nodes(g1_batched, feat=temp_feat_name)
+        del g1_batched.ndata[temp_feat_name]
+        h1 = self.projection_head(pooled_rep1)
+        
+        rep2 = self.encoder(g2_batched, g2_batched.ndata['feature'])
+        
+        temp_feat_name = "_temp_rep2_for_pooling" # 可以复用键名，但为了清晰分开写
+        g2_batched.ndata[temp_feat_name] = rep2
+        pooled_rep2 = dgl.mean_nodes(g2_batched, feat=temp_feat_name)
+        del g2_batched.ndata[temp_feat_name]
+        h2 = self.projection_head(pooled_rep2)
+        
+        # 4. 计算图级别对比损失
+        loss_cont = self.info_nce_loss(h1, h2)
+        
+        return loss_cont
 
 
 

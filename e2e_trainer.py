@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import dgl.function as fn
 from tqdm import tqdm
 import numpy as np
+import pprint 
 import dgl
 import pprint
 import time
@@ -12,6 +13,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
 from utils.misc import FocalLoss
 from predictors.unirhogad_predictor import Uni_RHO_GAD_Predictor
 from data.anomaly_generator import AnomalyGenerator
+from models.pretrain_model import augment_graph_view
 from utils.misc import get_current_lr
 
 class Trainer:
@@ -93,10 +95,37 @@ class Trainer:
         
         return weights.to(self.device)
 
+    def _calculate_composite_score(self, metrics_dict: dict) -> float:
+        """
+        根据一个epoch的完整验证集评估结果，计算一个综合分数。
+        """
+        # --- 策略：对所有我们关心的任务和指标，进行加权平均 ---
+        scores = []
+        weights = []
+        
+        # 遍历所有 cross_modes
+        for mode, tasks_metrics in metrics_dict.items():
+            # 遍历该模式下的所有任务
+            for task, metrics in tasks_metrics.items():
+                # 遍历我们关心的指标
+                if 'AUPRC' in metrics:
+                    # 我们可以给 AUPRC 更高的权重，因为它更重要
+                    scores.append(metrics['AUPRC'])
+                    weights.append(1.0) # AUPRC 权重为 1.0
+                if 'AUROC' in metrics:
+                    scores.append(metrics['AUROC'])
+                    weights.append(0.5) # AUROC 权重为 0.5 (可以调整)
+
+        if not scores:
+            return -1.0 # 如果没有任何有效分数
+
+        # 计算加权平均分
+        composite_score = np.average(scores, weights=weights)
+        return composite_score
 
     def train(self):
         """执行完整的训练、验证和早停流程"""
-        best_val_metric = -1.0
+        best_composite_score = -1.0
         patience_counter = 0
         best_test_metrics = None
         start_time = time.time()
@@ -112,6 +141,32 @@ class Trainer:
             for data in pbar:
                 # collate_fn 返回 (原始图/批处理图, 标签字典, 任务图字典)
                 original_graph, batched_labels, task_graphs = data
+
+                # 这个逻辑只在多图场景下，并且开关打开时执行
+                if self.args.use_downstream_multi_graph_aug and not self.model.is_single_graph:
+                    # 确认我们有图可以增强
+                    if 'g' in task_graphs:
+                        g_batched = task_graphs['g']
+                        original_features = g_batched.ndata['feature']
+                        
+                        # 解批处理 -> 逐图增强 -> 重新批处理
+                        graphs = dgl.unbatch(g_batched)
+                        nodes_per_graph = g_batched.batch_num_nodes().tolist()
+                        node_offsets = [0] + np.cumsum(nodes_per_graph).tolist()
+                        
+                        aug_graph_list = []
+                        for i, g in enumerate(graphs):
+                            start, end = node_offsets[i], node_offsets[i+1]
+                            g_features = original_features[start:end]
+                            # 为下游训练创建一个增强视图
+                            # 这里的增强参数可以硬编码，或者也加入到配置文件中
+                            aug_graph_list.append(augment_graph_view(g, g_features, 
+                                                                     drop_node_rate=0.2, 
+                                                                     perturb_edge_rate=0.2, 
+                                                                     mask_feature_rate=0.2))
+                        
+                        # 用增强后的批处理图替换原来的图
+                        task_graphs['g'] = dgl.batch(aug_graph_list)
                 
                 # 将所有数据移动到设备
                 task_graphs = {k: v.to(self.device) for k, v in task_graphs.items()}
@@ -132,15 +187,23 @@ class Trainer:
                 loss_cls = 0
                 # 遍历所有 cross_modes 的输出
                 for mode_name, logits_dict in all_logits.items():
-                    # 遍历该模式下的每个任务输出
                     for task, logits in logits_dict.items():
-                        if task in batched_labels and batched_labels[task].numel() > 0:
+                        # 确定用于监督的标签键
+                        # 对于多图，所有任务都用图标签'g'监督
+                        # 对于单图，每个任务用自己的标签'n'或'e'监督
+                        label_key = 'g' if not self.model.is_single_graph else task
 
-                            labels = batched_labels[task]
-                            # 计算动态类别权重
-                            class_weights = self._calculate_loss_weights(labels)
-                            loss_cls += self.classification_loss_fn(logits, labels, weight=class_weights)
-
+                        if label_key in batched_labels and batched_labels[label_key].numel() > 0:
+                            labels = batched_labels[label_key]
+                            # 确保logits和labels的批次维度匹配
+                            if logits.shape[0] == labels.shape[0]:
+                                class_weights = self._calculate_loss_weights(labels)
+                                task_weight = getattr(self.args, f'w_classification_{task}', 1.0)
+                                loss_cls += task_weight * self.classification_loss_fn(logits, labels, weight=class_weights)
+                            else:
+                                # 添加警告，防止未来出现未预料的维度不匹配
+                                print(f"Warning: Skipping loss calculation for task '{task}' in mode '{mode_name}' due to shape mismatch. "
+                                      f"Logits: {logits.shape}, Labels: {labels.shape}")
                             
                 
                 # 加权组合所有损失
@@ -162,37 +225,28 @@ class Trainer:
             val_metrics = self.evaluate('val')
             
             # --- 早停逻辑 ---
-            current_val_metric = -1.0
-            monitor_key_found = False
-
-            # 定义一个首选的监控顺序
-            preferred_modes = [mode.replace('2', '_to_') for mode in self.args.cross_modes.split(',')]
-            preferred_tasks = ['n', 'g', 'e']
-
-            for mode in preferred_modes:
-                if mode in val_metrics and val_metrics[mode]: # 确保 mode 存在且其结果不为空
-                    for task in preferred_tasks:
-                        if task in val_metrics[mode] and self.args.metric in val_metrics[mode][task]:
-                            current_val_metric = val_metrics[mode][task][self.args.metric]
-                            print(f"Epoch {epoch:03d} | Val Metric ({self.args.metric} on {mode}/{task}): {current_val_metric:.4f}")
-                            monitor_key_found = True
-                            break # 找到了，跳出内层循环
-                if monitor_key_found:
-                    break # 找到了，跳出外层循环
+            # 1. 计算当前epoch的综合分数
+            current_composite_score = self._calculate_composite_score(val_metrics)
             
-            if not monitor_key_found:
-                print("Warning: Could not get any valid validation metric for early stopping. Skipping check.")
+            print(f"Epoch {epoch:03d} | Avg Train Loss: {avg_train_loss:.4f} | Composite Val Score: {current_composite_score:.4f}")
 
-            if current_val_metric > best_val_metric:
-                best_val_metric = current_val_metric
+            # 2. 基于综合分数进行模型选择
+            if current_composite_score > best_composite_score:
+                best_composite_score = current_composite_score
                 patience_counter = 0
-                print("New best validation score! Evaluating on test set...")
+                print("New best composite validation score! Evaluating on test set...")
                 best_test_metrics = self.evaluate('test')
-                # 打印当前最佳的测试结果
+
+                
+                # 遍历所有 cross_modes 的结果
                 for mode, metrics_dict in best_test_metrics.items():
-                    print(f"  > Test Results for mode [{mode}]:")
+                    # 打印模式名称，例如 "> Test Results for mode [ne_to_ne]:"
+                    print(f"  > Test Results for mode [{mode.replace('_to_', '2')}]:")
+                    # 遍历该模式下所有任务的结果
                     for task, metrics in metrics_dict.items():
-                        print(f"    - Task [{task}]: {', '.join([f'{k}: {v:.4f}' for k, v in metrics.items()])}")
+                        # 格式化输出每个任务的所有指标
+                        metrics_str = ', '.join([f'{k}: {v:.4f}' for k, v in metrics.items()])
+                        print(f"    - Task [{task}]: {metrics_str}")
             else:
                 patience_counter += 1
             
@@ -232,12 +286,16 @@ class Trainer:
 
                 for mode_name, logits_dict in all_logits.items():
                     for task, logits in logits_dict.items():
-                        if task in batched_labels and batched_labels[task].numel() > 0:
-                            probs = F.softmax(logits, dim=1)[:, 1]
-                            # 确保 mode_name 和 task 在 all_preds 中存在
-                            if mode_name in all_preds and task in all_preds[mode_name]:
-                                all_preds[mode_name][task].append(probs.cpu())
-                                all_labels[mode_name][task].append(batched_labels[task].cpu())
+                        label_key = 'g' if not self.model.is_single_graph else task
+
+                        if label_key in batched_labels and batched_labels[label_key].numel() > 0:
+                            labels = batched_labels[label_key].cpu()
+                            # 确保logits和labels的批次维度匹配
+                            if logits.shape[0] == labels.shape[0]:
+                                probs = F.softmax(logits, dim=1)[:, 1].cpu()
+                                if mode_name in all_preds and task in all_preds[mode_name]:
+                                    all_preds[mode_name][task].append(probs)
+                                    all_labels[mode_name][task].append(labels)
         
         # 计算最终指标
         final_metrics = {}
@@ -249,5 +307,4 @@ class Trainer:
                     labels_cat = torch.cat(all_labels[mode_name][task])
                     final_metrics[mode_name][task] = self._compute_metrics(labels_cat, preds_cat)
 
-        
         return final_metrics

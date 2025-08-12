@@ -3,7 +3,7 @@
 # ======================================================================
 
 # e.g. bm/dgl/bm_mn_dgl, bm/dgl/bm_ms_dgl, bm/dgl/bm_mn_mt_dgl, mnist_processed/mnist0_strict, mnist_processed/mnist1_strict
-dataset: 'mutag/dgl/mutag0'
+dataset: 'mnist_processed/mnist0_strict'
 
 # --- 路径与设备 ---
 data_dir: ./data
@@ -14,7 +14,7 @@ device: cuda
 # --- 训练控制 ---
 seed: 42
 num_trials: 5
-epochs: 100
+epochs: 200
 patience: 30
 batch_size: 32
 metric: AUPRC
@@ -32,7 +32,7 @@ final_mlp_layers: 2
 gna_proj_dim: 128
 
 # --- 预训练模型架构 ---
-pretrain_path: './pretrained/mutag_dgl_mutag0_enc_gcn2_dec_gcn1_e100_h128_loss_sce.pt'
+pretrain_path: './pretrained/mnist_processed_mnist0_strict_enc_gcn2_dec_gcn1_e100_h128_loss_sce.pt'
 pretrain_encoder_type: 'gcn'
 pretrain_decoder_type: 'gcn'
 pretrain_hid_dim: 128
